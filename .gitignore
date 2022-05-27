@@ -1,0 +1,5 @@
+resources/*
+*.txt
+*.zip
+*.h5
+.idea
