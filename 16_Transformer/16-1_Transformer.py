@@ -1,46 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
-from tensorflow.keras.layers import Layer, Dense, Dropout, LayerNormalization
 from tensorflow.keras import Input, Model
-
-
-class PositionalEncoding(Layer):
-    def __init__(self, position, d_model):
-        super(PositionalEncoding, self).__init__()
-        self.pos_encoding = self.positional_encoding(position, d_model)
-
-    def get_angle(self, position, i, d_model):
-        angles = 1 / tf.pow(10000, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
-        return position * angles
-
-    def positional_encoding(self, position, d_model):
-        # insert another axis using tf.newaxis
-        angle_rads = self.get_angle(position=tf.range(position, dtype=tf.float32)[:, tf.newaxis],
-                                    i=tf.range(d_model, dtype=tf.float32)[tf.newaxis, :],
-                                    d_model=d_model)
-
-        # angle_rads 크기 (position,d_model)
-        # 배열의 짝수 인덱스(2i)는 사인 함수 적용
-        sines = tf.math.sin(angle_rads[:, 0::2])
-
-        # 배열의 홀수 인덱스(2i+1)에는 코사인 함수 적용
-        cosines = tf.math.cos(angle_rads[:, 1::2])
-
-        angle_rads = np.zeros(angle_rads.shape)
-        angle_rads[:, 0::2] = sines
-        angle_rads[:, 1::2] = cosines
-
-        pos_encoding = tf.constant(angle_rads)
-        pos_encoding = pos_encoding[tf.newaxis, ...]
-
-        print(pos_encoding.shape)
-        return tf.cast(pos_encoding, tf.float32)
-
-    def call(self, inputs):
-        # inputs shape는 보통 (batch_size, input_length(position), embeddingDim(d_model)) 일텐데
-        # 왜 input length에 해당하는 부분에 axis를 새로 만드는걸까? inputs shape에 대해 다시 확인 필요.
-        return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
+from tensorflow.keras.layers import Layer, Dense, Dropout, LayerNormalization, Embedding, Lambda
+from tensorflow.keras.utils import plot_model
 
 
 def scaled_dot_product_attention(query, key, value, mask):
@@ -91,13 +54,208 @@ def create_padding_mask(x):
 
 # 디코더의 첫번째 서브층(sublayer)에서 미래 토큰을 Mask하는 함수
 def create_look_ahead_mask(x):
-    seq_len = tf.reshape(x)[1]
+    seq_len = tf.shape(x)[1]
     # 하삼각행렬 생성
     look_ahead_mask = 1 - tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
     print('look_ahead_mask shape : {}'.format(look_ahead_mask.shape))
     padding_mask = create_padding_mask(x)  # 패딩마스크도 포함
     print('padding_mask shape : {}'.format(padding_mask))
     return tf.maximum(look_ahead_mask, padding_mask)  # 두 행렬 모두 포함하도록 maximum함수 이용
+
+
+def encoder_layer(dff, d_model, num_heads, dropout, name="encoder_layer"):
+    # (batch_size, input_length, d_model)?
+    inputs = Input(shape=(None, d_model), name="inputs")
+    """ inputs와 padding_mask shape 디버그 찍어보기 """
+    # 인코더는 패딩 마스크 사용
+    # 패딩마스크는 단어토큰별로 처리되므로 embedding_dim 차원까지는 필요없음 input_length 차원까지 있으면 됨)
+    padding_mask = Input(shape=(1, 1, None), name="padding_mask")
+
+    # 멀티-헤드 어텐션 (첫번째 서브층 / 셀프 어텐션)
+    attention = MultiHeadAttention(d_model, num_heads, name="attention")({
+        'query': inputs, 'key': inputs, 'value': inputs,  # Q=K=V
+        'mask': padding_mask
+    })
+
+    # 드롭아웃 + 잔차 연결과 층 정규화
+    attention = Dropout(rate=dropout)(attention)
+    attention = LayerNormalization(epsilon=1e-6)(inputs + attention)
+
+    # 포지션 와이즈 피드 포워드 신경망 (두번째 서브층)
+    outputs = Dense(units=dff, activation='relu')(attention)
+    outputs = Dense(units=d_model)(outputs)
+
+    # 드롭아웃 + 잔차 연결과 층 정규화
+    outputs = Dropout(rate=dropout)(outputs)
+    outputs = LayerNormalization(epsilon=1e-6)(outputs + attention)
+
+    return Model(inputs=[inputs, padding_mask], outputs=outputs, name=name)
+
+
+def encoder(vocab_size, num_layers, dff, d_model, num_heads, dropout, name="encoder"):
+    inputs = Input(shape=(None,), name="inputs")  # 크기 (batch_size, input_length) : Embedding Layer에 들어갈때는 원핫인코딩할필요 없음.
+    padding_mask = Input(shape=(1, 1, None), name="padding_mask")
+    # 위 두개의 Model Input은 실제 값이 아닌데도 내부에 정의된 tensorflow Model의 Input으로 들어갈수 있음.
+    # 가장 바깥쪽에 있는 곳에서 실제 데이터가 들어가기만 하면 Model Input은 내부 모델의 Input으로 들어갈수 있는것으로 보임.
+    print('encoder : inputs shape = {}'.format(inputs.shape))
+    print('encoder : padding_mask shape = {}'.format(padding_mask.shape))
+
+    # 포지셔널 인코딩 + 드롭아웃
+    embeddings = Embedding(vocab_size, d_model)(inputs)
+    # 저자의 의견 : 트랜스포머 공식 구현체를 보면 임베딩 벡터를 임베딩 벡터 사이즈의 루트만큼 나눠주고 있습니다. 그래디언트 배니싱 문제를 완화하는 테크닉으로 보여집니다.
+    embeddings *= tf.math.sqrt(tf.cast(d_model, tf.float32))
+    print('encoder : before PE embeddings shape = {}'.format(embeddings.shape))
+    embeddings = PositionalEncoding(vocab_size, d_model)(embeddings)
+    outputs = Dropout(rate=dropout)(embeddings)
+
+    # 인코더를 num_layers 개 쌓기
+    for i in range(num_layers):
+        outputs = encoder_layer(dff=dff, d_model=d_model, num_heads=num_heads, dropout=dropout,
+                                name="encoder_layer_{}".format(i))([outputs, padding_mask])
+
+    return Model(inputs=[inputs, padding_mask], outputs=outputs, name=name)
+
+
+def decoder_layer(dff, d_model, num_heads, dropout, name="decoder_layer"):
+    inputs = Input(shape=(None, d_model), name="inputs")
+    enc_outputs = Input(shape=(None, d_model), name="encoder_outputs")
+    print('decoder_layer : inputs shape = {}, enc_outputs shape = {}'.format(inputs.shape, enc_outputs.shape))
+    # 룩어헤드 마스크(첫번째 서브층)
+    look_ahead_mask = Input(shape=(1, None, None), name="look_ahead_mask")
+    print('decoder_layer : look_ahead_mask shape = {}'.format(look_ahead_mask.shape))
+
+    # 패딩 마스크(두번째 서브층)
+    padding_mask = Input(shape=(1, 1, None), name="padding_mask")
+    print('decoder_layer : padding_mask shape = {}'.format(padding_mask.shape))
+
+    # 멀티-헤드 어텐션 (첫번째 서브층/마스크드 셀프 어텐션)
+    attention1 = MultiHeadAttention(d_model, num_heads, name="attention_1")(
+        inputs={'query': inputs, 'key': inputs, 'value': inputs,  # Q=K=V
+                'mask': look_ahead_mask})
+
+    # 잔차 연결과 층 정규화
+    attention1 = LayerNormalization(epsilon=1e-6)(attention1 + inputs)
+
+    # 멀티-헤드 어텐션(두번째 서브층/디코더-인코더 어텐션)
+    attention2 = MultiHeadAttention(d_model, num_heads, name="attention_2") \
+        (inputs={'query': inputs, 'key': enc_outputs, 'value': enc_outputs,  # Q!=K=V
+                 'mask': padding_mask})
+
+    # 드롭아웃 + 잔차 연결과 층 정규화
+    attention2 = Dropout(rate=dropout)(attention2)
+    attention2 = LayerNormalization(epsilon=1e-6)(attention2 + attention1)
+
+    # 포지션 와이즈 피드 포워드 신경망 (세번째 서브층)
+    outputs = Dense(units=dff, activation='relu')(attention2)
+    outputs = Dense(units=d_model)(outputs)
+
+    # 드롭아웃 + 잔차 연결과 층 정규화
+    outputs = Dropout(rate=dropout)(outputs)
+    outputs = LayerNormalization(epsilon=1e-6)(outputs + attention2)
+
+    return Model(inputs=[inputs, enc_outputs, look_ahead_mask, padding_mask], outputs=outputs, name=name)
+
+
+def decoder(vocab_size, num_layers, dff, d_model, num_heads, dropout, name='decoder'):
+    inputs = Input(shape=(None,), name='inputs')
+    enc_outputs = Input(shape=(None, d_model), name='encoder_outputs')
+    print('decoder : inputs shape = {}, enc_outputs shape = {}'.format(inputs.shape, enc_outputs.shape))
+    # 디코더는 룩어헤드 마스크(첫번째 서브층)과 패딩 마스크(두번째 서브층) 둘 다 사용.
+    look_ahead_mask = Input(shape=(1, None, None), name='look_ahead_mask')
+    padding_mask = Input(shape=(1, 1, None), name='padding_mask')
+    print('decoder : look_ahead_mask shape = {}'.format(look_ahead_mask.shape))
+    print('decoder : padding_mask shape = {}'.format(padding_mask.shape))
+    # 포지셔널 인코딩 + 드롭아웃
+    embeddings = Embedding(vocab_size, d_model)(inputs)
+    embeddings *= tf.math.sqrt(tf.cast(d_model, tf.float32))
+    print('decoder : before PE embeddings shape = {}'.format(embeddings.shape))
+    embeddings = PositionalEncoding(vocab_size, d_model)(embeddings)
+    outputs = Dropout(rate=dropout)(embeddings)
+
+    # 디코더를 num_layers개 쌓기
+    for i in range(num_layers):
+        outputs = decoder_layer(dff=dff, d_model=d_model, num_heads=num_heads, dropout=dropout,
+                                name='decoder_layer_{}'.format(i))(
+            inputs=[outputs, enc_outputs, look_ahead_mask, padding_mask])
+    return Model(inputs=[inputs, enc_outputs, look_ahead_mask, padding_mask], outputs=outputs, name=name)
+
+
+def transformer(vocab_size, num_layers, dff, d_model, num_heads, dropout, name="transformer"):
+    # 인코더 입력
+    inputs = Input(shape=(None,), name="inputs")
+
+    # 디코더 입력
+    dec_inputs = Input(shape=(None,), name="dec_inputs")
+
+    # 인코더의 패딩 마스크
+    # Lambda Layer를 통해 create_padding_mask 메소드 기능을 수행하는 Layer를 바로 생성한다.
+    enc_padding_mask = Lambda(create_padding_mask, output_shape=(1, 1, None),
+                              name="enc_padding_mask")(inputs)
+
+    # 디코더의 룩어헤드 마스크(첫번째 서브층)
+    look_ahead_mask = Lambda(create_look_ahead_mask, output_shape=(1, None, None),
+                             name="look_ahead_mask")(dec_inputs)
+
+    # 디코더의 패딩 마스크(두번째 서브층)
+    # 두번째 서브층에서 Key인 인코더 문장에 대해 패딩마스크를 씌워야함.
+    dec_padding_mask = Lambda(create_padding_mask, output_shape=(1, 1, None),
+                              name="dec_padding_mask")(inputs)
+
+    # 인코더의 출력은 enc_outputs. 디코더로 전달된다.
+    enc_outputs = encoder(vocab_size=vocab_size, num_layers=num_layers, dff=dff, d_model=d_model,
+                          num_heads=num_heads, dropout=dropout)(inputs=[inputs, enc_padding_mask])
+
+    # 디코더의 출력은 dec_outputs. 출력층으로 전달.
+    dec_outputs = decoder(vocab_size=vocab_size, num_layers=num_layers, dff=dff, d_model=d_model,
+                          num_heads=num_heads, dropout=dropout)(
+        inputs=[dec_inputs, enc_outputs, look_ahead_mask, dec_padding_mask]) \
+ \
+        # 다음 단어 예측을 위한 출력층
+    outputs = Dense(units=vocab_size, name="outputs")(dec_outputs)
+
+    return Model(inputs=[inputs, dec_inputs], outputs=outputs, name=name)
+
+
+class PositionalEncoding(Layer):
+    def __init__(self, position, d_model):
+        super(PositionalEncoding, self).__init__()
+        self.pos_encoding = self.positional_encoding(position, d_model)
+
+    def get_angle(self, position, i, d_model):
+        angles = 1 / tf.pow(10000, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
+        return position * angles
+
+    def positional_encoding(self, position, d_model):
+        # insert another axis using tf.newaxis
+        angle_rads = self.get_angle(position=tf.range(position, dtype=tf.float32)[:, tf.newaxis],
+                                    i=tf.range(d_model, dtype=tf.float32)[tf.newaxis, :],
+                                    d_model=d_model)
+
+        # angle_rads 크기 (position,d_model)
+        # 배열의 짝수 인덱스(2i)는 사인 함수 적용
+        sines = tf.math.sin(angle_rads[:, 0::2])
+
+        # 배열의 홀수 인덱스(2i+1)에는 코사인 함수 적용
+        cosines = tf.math.cos(angle_rads[:, 1::2])
+
+        angle_rads = np.zeros(angle_rads.shape)
+        angle_rads[:, 0::2] = sines
+        angle_rads[:, 1::2] = cosines
+
+        pos_encoding = tf.constant(angle_rads)
+        pos_encoding = pos_encoding[tf.newaxis, ...]
+
+        print('pos_encoding shape = {}'.format(pos_encoding.shape))
+        return tf.cast(pos_encoding, tf.float32)
+
+    def call(self, inputs):
+        # inputs shape는 보통 (batch_size, input_length(position), embeddingDim(d_model)) 일텐데
+        # 왜 input length에 해당하는 부분에 axis를 새로 만드는걸까? inputs shape에 대해 다시 확인 필요.
+        print('pos_encoding call : inputs shape = {}, pos_encoding reshape = {}'.format(inputs.shape,
+                                                                                        self.pos_encoding[:,
+                                                                                        :tf.shape(inputs)[1], :].shape))
+        print('pos_encoding call : inputs shape[1] = {}'.format(tf.shape(inputs)[1]))
+        return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
 
 
 class MultiHeadAttention(tf.keras.layers.Layer):
@@ -182,46 +340,19 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         return outputs
 
 
-def encoder_layer(dff, d_model, num_heads, dropout, name="encoder_layer"):
-    # (batch_size, input_length, d_model)?
-    inputs = Input(shape=(None, d_model), name="inputs")
-    """ inputs와 padding_mask shape 디버그 찍어보기 """
-    # 인코더는 패딩 마스크 사용
-    # 패딩마스크는 단어토큰별로 처리되므로 embedding_dim 차원까지는 필요없음 input_length 차원까지 있으면 됨)
-    padding_mask = Input(shape=(1, 1, None), name="padding_mask")
-
-    # 멀티-헤드 어텐션 (첫번째 서브층 / 셀프 어텐션)
-    attention = MultiHeadAttention(d_model, num_heads, name="attention")({
-        'query': inputs, 'key': inputs, 'value': inputs,  # Q=K=V
-        'mask': padding_mask
-    })
-
-    # 드롭아웃 + 잔차 연결과 층 정규화
-    attention = Dropout(rate=dropout)(attention)
-    attention = LayerNormalization(epsilon=1e-6)(inputs + attention)
-
-    # 포지션 와이즈 피드 포워드 신경망 (두번째 서브층)
-    outputs = Dense(units=dff, activation='relu')(attention)
-    outputs = Dense(units=d_model)(outputs)
-
-    # 드롭아웃 + 잔차 연결과 층 정규화
-    outputs = Dropout(rate=dropout)(outputs)
-    outputs = LayerNormalization(epsilon=1e-6)(outputs + attention)
-
-    return Model(inputs=[inputs, padding_mask], outputs=outputs, name=name)
-
-def encoder(vocab_size, num_layers, dff, d_model, num_heads, dropout, name="encoder"):
-
-    inputs = Input(shape=(None,), name="inputs")
-    padding_mask = Input(shape=(1,1,None), name="padding_mask")
-    # 위 두개의 Model Input은 실제 값이 아닌데도 내부에 정의된 tensorflow Model의 Input으로 들어갈수 있음.
-    # 가장 바깥쪽에 있는 곳에서 실제 데이터가 들어가기만 하면 Model Input은 내부 모델의 Input으로 들어갈수 있는것으로 보임.
-    
-    """추가코드 작성하기"""
-
 class TestPosEncoding:
     def process(self):
-        sample_pos_encoding = PositionalEncoding(500, 128)
+        input_length = 500
+        sample_pos_encoding = PositionalEncoding(9000, 150)
+        print('sample_pos_encoding shape = {}'.format(sample_pos_encoding.pos_encoding.shape))
+        plt.pcolormesh(sample_pos_encoding.pos_encoding.numpy()[0], cmap='RdBu')
+        plt.xlabel('Depth')
+        plt.xlim((0, 128))
+        plt.ylabel('Position')
+        plt.colorbar()
+        plt.show()
+        sample_pos_encoding.pos_encoding = sample_pos_encoding.pos_encoding[:, :500, :]
+        print('sample_pos_encoding shape = {}'.format(sample_pos_encoding.pos_encoding.shape))
         plt.pcolormesh(sample_pos_encoding.pos_encoding.numpy()[0], cmap='RdBu')
         plt.xlabel('Depth')
         plt.xlim((0, 128))
@@ -261,6 +392,21 @@ class TestScaledDocProductAttention:
         print(temp_out)  # 어텐션 값
 
 
+class TestMakeTransformer:
+    def process(self):
+        small_transformer = transformer(
+            vocab_size=9000,
+            num_layers=4,
+            dff=512,
+            d_model=128,
+            num_heads=4,
+            dropout=0.3,
+            name="small_transformer"
+        )
+        plot_model(small_transformer, to_file='small_transformer.png', show_shapes=True)
+
+
 if __name__ == "__main__":
-    # Encoder().encoder(vocab_size=10000, d_model=256)
-    TestScaledDocProductAttention().process()
+    # TestScaledDocProductAttention().process()
+    # TestPosEncoding().process()
+    TestMakeTransformer().process()
