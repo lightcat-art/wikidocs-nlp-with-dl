@@ -4,6 +4,7 @@ import tensorflow as tf
 from tensorflow.keras import Input, Model
 from tensorflow.keras.layers import Layer, Dense, Dropout, LayerNormalization, Embedding, Lambda
 from tensorflow.keras.utils import plot_model
+from tensorflow.keras.optimizers.schedules import LearningRateSchedule
 
 
 def scaled_dot_product_attention(query, key, value, mask):
@@ -61,9 +62,9 @@ def create_look_ahead_mask(x):
     # 크기 (query 문장길이, key문장길이) 에 대한 하삼각행렬 생성
     # -> 사실상 디코더의 첫번째 서브층에만 look_ahead_mask가 적용되므로, query이든 key이든 문장길이는 똑같음.
     look_ahead_mask = 1 - tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
-    print('look_ahead_mask shape : {}'.format(look_ahead_mask.shape))
+    # print('look_ahead_mask shape : {}'.format(look_ahead_mask.shape))
     padding_mask = create_padding_mask(x)  # 패딩마스크도 포함
-    print('padding_mask shape : {}'.format(padding_mask))
+    # print('padding_mask shape : {}'.format(padding_mask))
     # padding_mask와 look_ahead_mask의 텐서차원이 다르지만,
     # look_ahead_mask = (None, None) = (query 문장길이, key 문장 길이)
     # padding_mask = (None, 1, 1, None) = (batch_size, num_heads, query 문장 길이, key 문장 길이)
@@ -231,11 +232,57 @@ def transformer(vocab_size, num_layers, dff, d_model, num_heads, dropout, name="
         inputs=[dec_inputs, enc_outputs, look_ahead_mask, dec_padding_mask])
     print('Transformer : decoder outputs shape = {}'.format(dec_outputs.shape))
 
-        # 다음 단어 예측을 위한 출력층
+    # 다음 단어 예측을 위한 출력층
     outputs = Dense(units=vocab_size, name="outputs")(dec_outputs)
     print('Transformer : predict output shape = {}'.format(outputs.shape))
 
     return Model(inputs=[inputs, dec_inputs], outputs=outputs, name=name)
+
+
+class CustomSchedule(LearningRateSchedule):
+    def __init__(self, d_model, warmup_steps=4000):
+        super(CustomSchedule, self).__init__()
+        self.d_model = d_model
+        self.d_model = tf.cast(self.d_model, tf.float32)
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        arg1 = tf.math.rsqrt(step)
+        arg2 = step * (self.warmup_steps ** -1.5)
+
+        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+
+    # get_config 사용하고 싶지 않으면 model.save_weight와 load_weights 사용.
+    # def get_config(self):
+    #     config = super().get_config().copy()
+    #     config.update({
+    #         'd_model': self.d_model,
+    #         'warmup_steps': self.warmup_steps
+    #     })
+    #     return config
+
+    # 왜 되는거야??...
+    # def get_config(self):
+    #     config = {
+    #         # "d_model": self.d_model,
+    #         "warmup_steps": self.warmup_steps
+    #     }
+    #
+    #     return config
+
+    def get_config(self):
+        config = {
+            "d_model": self.d_model,
+            "warmup_steps": self.warmup_steps
+        }
+        base_config = super(CustomSchedule, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+    # There's actually no need to define `from_config` here, since returning
+    # `cls(**config)` is the default behavior.
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 class PositionalEncoding(Layer):
