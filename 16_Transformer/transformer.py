@@ -25,8 +25,11 @@ def scaled_dot_product_attention(query, key, value, mask):
 
     # 마스킹. 에턴션 스코어 행렬의 마스킹 할 위치에 매우 작은 음수값을 넣는다.
     # 매우 작은 값이므로 소프트맥스 함수를 지나면 행렬의 해당 위치의 값은 0이 됨.
+    print("before masking : {}".format(logits))
     if mask is not None:
+        print("mask info : {}".format(mask))
         logits += (mask * -1e9)
+    print("after masking : {}".format(logits))
 
     # 소프트 맥스 함수는 마지막 차원인 key의 문장 길이 방향으로 수행
     # attention weight : (batch_size, num_heads, query의 문장 길이, key의 문장 길이)
@@ -440,20 +443,28 @@ class TestScaledDocProductAttention:
     def process(self):
         # 임의의 Query, Key, Value인 Q, K, V 행렬 생성
         np.set_printoptions(suppress=True)
+        # temp_k = tf.constant([[10, 0, 0],
+        #                       [0, 10, 0],
+        #                       [0, 0, 10],
+        #                       [0, 0, 10]], dtype=tf.float32)  # (4, 3)
+        #
+        # temp_v = tf.constant([[1, 0],
+        #                       [10, 0],
+        #                       [100, 5],
+        #                       [1000, 6]], dtype=tf.float32)  # (4, 2)
+
         temp_k = tf.constant([[10, 0, 0],
-                              [0, 10, 0],
-                              [0, 0, 10],
-                              [0, 0, 10]], dtype=tf.float32)  # (4, 3)
+                              [0, 10, 0]], dtype=tf.float32)  # (2, 3)
 
         temp_v = tf.constant([[1, 0],
-                              [10, 0],
-                              [100, 5],
-                              [1000, 6]], dtype=tf.float32)  # (4, 2)
+                              [10, 0]], dtype=tf.float32)  # (4, 2)
 
-        temp_q = tf.constant([[10, 10, 0], [0, 10, 0]], dtype=tf.float32)  # (1, 3)
+        temp_q = tf.constant([[10, 10, 0], [0, 10, 0]], dtype=tf.float32)  # (2, 3)
+
+        temp_mask = 1 - tf.linalg.band_part(tf.ones((2, 2)), -1, 0)
 
         # 함수 실행
-        temp_out, temp_attn = scaled_dot_product_attention(temp_q, temp_k, temp_v, None)
+        temp_out, temp_attn = scaled_dot_product_attention(temp_q, temp_k, temp_v, temp_mask)
 
         # 1. q와 k의 유사도를 구하는데, k의 행을 스캔하면서 단어별 유사도(어텐션 분포) 계산
         # 2. 구한 어텐션스코어를 가지고 v에 대입해 최종 어텐션 스코어 계산
@@ -482,6 +493,6 @@ class TestMakeTransformer:
 
 
 if __name__ == "__main__":
-    # TestScaledDocProductAttention().process()
+    TestScaledDocProductAttention().process()
     # TestPosEncoding().process()
-    TestMakeTransformer().process()
+    # TestMakeTransformer().process()
